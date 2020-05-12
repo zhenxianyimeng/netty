@@ -85,6 +85,7 @@ abstract class DnsResolveContext<T> {
             "tryToFinishResolve(..)");
 
     final DnsNameResolver parent;
+    private final Promise<?> originalPromise;
     private final DnsServerAddressStream nameServerAddrs;
     private final String hostname;
     private final int dnsClass;
@@ -101,13 +102,13 @@ abstract class DnsResolveContext<T> {
     private boolean triedCNAME;
     private boolean completeEarly;
 
-    DnsResolveContext(DnsNameResolver parent,
+    DnsResolveContext(DnsNameResolver parent, Promise<?> originalPromise,
                       String hostname, int dnsClass, DnsRecordType[] expectedTypes,
                       DnsRecord[] additionals, DnsServerAddressStream nameServerAddrs) {
-
         assert expectedTypes.length > 0;
 
         this.parent = parent;
+        this.originalPromise = originalPromise;
         this.hostname = hostname;
         this.dnsClass = dnsClass;
         this.expectedTypes = expectedTypes;
@@ -163,7 +164,8 @@ abstract class DnsResolveContext<T> {
     /**
      * Creates a new context with the given parameters.
      */
-    abstract DnsResolveContext<T> newResolverContext(DnsNameResolver parent, String hostname,
+    abstract DnsResolveContext<T> newResolverContext(DnsNameResolver parent, Promise<?> originalPromise,
+                                                     String hostname,
                                                      int dnsClass, DnsRecordType[] expectedTypes,
                                                      DnsRecord[] additionals,
                                                      DnsServerAddressStream nameServerAddrs);
@@ -262,8 +264,8 @@ abstract class DnsResolveContext<T> {
     }
 
     void doSearchDomainQuery(String hostname, Promise<List<T>> nextPromise) {
-        DnsResolveContext<T> nextContext = newResolverContext(parent, hostname, dnsClass, expectedTypes,
-                                                              additionals, nameServerAddrs);
+        DnsResolveContext<T> nextContext = newResolverContext(parent, originalPromise, hostname, dnsClass,
+                                                              expectedTypes, additionals, nameServerAddrs);
         nextContext.internalResolve(hostname, nextPromise);
     }
 
@@ -274,15 +276,52 @@ abstract class DnsResolveContext<T> {
         return name + '.';
     }
 
-    private void internalResolve(String name, Promise<List<T>> promise) {
-        for (;;) {
-            // Resolve from cnameCache() until there is no more cname entry cached.
-            String mapping = cnameCache().get(hostnameWithDot(name));
-            if (mapping == null) {
+    // Resolve the final name from the CNAME cache until there is nothing to follow anymore. This also
+    // guards against loops in the cache but early return once a loop is detected.
+    private String cnameResolveFromCache(String name) {
+        DnsCnameCache cnameCache = cnameCache();
+        String first = cnameCache.get(hostnameWithDot(name));
+        if (first == null) {
+            // Nothing in the cache at all
+            return name;
+        }
+
+        String second = cnameCache.get(hostnameWithDot(first));
+        if (second == null) {
+            // Nothing else to follow, return first match.
+            return first;
+        }
+
+        if (first.equals(second)) {
+            // Loop detected.... early return.
+            return first;
+        }
+
+        return cnameResolveFromCacheLoop(cnameCache, first, second);
+    }
+
+    private String cnameResolveFromCacheLoop(DnsCnameCache cnameCache, String first, String mapping) {
+        // Detect loops using a HashSet. We use this as last resort implementation to reduce allocations in the most
+        // common cases.
+        Set<String> cnames = new HashSet<String>(4);
+        cnames.add(first);
+        cnames.add(mapping);
+
+        String name = mapping;
+        // Resolve from cnameCache() until there is no more cname entry cached.
+        while ((mapping = cnameCache.get(hostnameWithDot(name))) != null) {
+            if (!cnames.add(mapping)) {
+                // Follow CNAME from cache would loop. Lets break here.
                 break;
             }
             name = mapping;
         }
+        return name;
+    }
+
+    private void internalResolve(String name, Promise<List<T>> promise) {
+        // Resolve from cnameCache() until there is no more cname entry cached.
+        name = cnameResolveFromCache(name);
 
         try {
             DnsServerAddressStream nameServerAddressStream = getNameServers(name);
@@ -352,7 +391,7 @@ abstract class DnsResolveContext<T> {
                        final Promise<List<T>> promise,
                        final Throwable cause) {
         if (completeEarly || nameServerAddrStreamIndex >= nameServerAddrStream.size() ||
-                allowedQueries == 0 || promise.isCancelled()) {
+                allowedQueries == 0 || originalPromise.isCancelled() || promise.isCancelled()) {
             tryToFinishResolve(nameServerAddrStream, nameServerAddrStreamIndex, question, queryLifecycleObserver,
                                promise, cause);
             return;
@@ -362,7 +401,7 @@ abstract class DnsResolveContext<T> {
 
         final InetSocketAddress nameServerAddr = nameServerAddrStream.next();
         if (nameServerAddr.isUnresolved()) {
-            queryUnresolvedNameserver(nameServerAddr, nameServerAddrStream, nameServerAddrStreamIndex, question,
+            queryUnresolvedNameServer(nameServerAddr, nameServerAddrStream, nameServerAddrStreamIndex, question,
                                       queryLifecycleObserver, promise, cause);
             return;
         }
@@ -416,7 +455,7 @@ abstract class DnsResolveContext<T> {
         });
     }
 
-    private void queryUnresolvedNameserver(final InetSocketAddress nameServerAddr,
+    private void queryUnresolvedNameServer(final InetSocketAddress nameServerAddr,
                                            final DnsServerAddressStream nameServerAddrStream,
                                            final int nameServerAddrStreamIndex,
                                            final DnsQuestion question,
@@ -455,7 +494,7 @@ abstract class DnsResolveContext<T> {
         if (!DnsNameResolver.doResolveAllCached(nameServerName, additionals, resolverPromise, resolveCache(),
                 parent.resolvedInternetProtocolFamiliesUnsafe())) {
             final AuthoritativeDnsServerCache authoritativeDnsServerCache = authoritativeDnsServerCache();
-            new DnsAddressResolveContext(parent, nameServerName, additionals,
+            new DnsAddressResolveContext(parent, originalPromise, nameServerName, additionals,
                                          parent.newNameServerAddressStream(nameServerName),
                                          resolveCache(), new AuthoritativeDnsServerCache() {
                 @Override
@@ -947,29 +986,14 @@ abstract class DnsResolveContext<T> {
 
     private DnsServerAddressStream getNameServers(String hostname) {
         DnsServerAddressStream stream = getNameServersFromCache(hostname);
-        return stream == null ? nameServerAddrs.duplicate() : stream;
+        // We need to obtain a new stream from the parent DnsNameResolver as the hostname may not be the same as the
+        // one used for the original query (for example we may follow CNAMEs).
+        return stream == null ? parent.newNameServerAddressStream(hostname) : stream;
     }
 
     private void followCname(DnsQuestion question, String cname, DnsQueryLifecycleObserver queryLifecycleObserver,
                              Promise<List<T>> promise) {
-        Set<String> cnames = null;
-        for (;;) {
-            // Resolve from cnameCache() until there is no more cname entry cached.
-            String mapping = cnameCache().get(hostnameWithDot(cname));
-            if (mapping == null) {
-                break;
-            }
-            if (cnames == null) {
-                // Detect loops.
-                cnames = new HashSet<String>(2);
-            }
-            if (!cnames.add(cname)) {
-                // Follow CNAME from cache would loop. Lets break here.
-                break;
-            }
-            cname = mapping;
-        }
-
+        cname = cnameResolveFromCache(cname);
         DnsServerAddressStream stream = getNameServers(cname);
 
         final DnsQuestion cnameQuestion;
